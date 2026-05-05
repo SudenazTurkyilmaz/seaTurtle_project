@@ -29,12 +29,12 @@ from agents.preprocessing_agent import (
     BATCH_SIZE,
     FREEZE_BACKBONE_EPOCHS,
     IMAGE_SIZE,
+    LEARNING_RATE_BACKBONE_FROZEN,
+    LEARNING_RATE_FINETUNE,
     MODEL_SAVE_PATH,
     MODELS_DIR,
     TRIPLET_EPOCHS,
     TRIPLET_MARGIN,
-    LEARNING_RATE_BACKBONE_FROZEN,
-    LEARNING_RATE_FINETUNE,
     build_embedding_model,
     custom_objects_for_model,
     load_image_file,
@@ -50,13 +50,8 @@ _EARLY_STOPPING_PATIENCE: int = 4
 _EARLY_STOPPING_MIN_DELTA: float = 1e-4
 
 
-def _build_run_model_path() -> Path:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return MODELS_DIR / f"turtle_reid_model_{stamp}.keras"
-
-
 class SaveBestEmbedding(keras.callbacks.Callback):
-    """Eğitim ``loss`` düştükçe çıkarım modelini (embedding ağı) diske yazar."""
+    """Egitim ``loss`` dustukce cikarim modelini diske yazar."""
 
     def __init__(self, embedding_net: keras.Model, path: Path) -> None:
         super().__init__()
@@ -66,6 +61,7 @@ class SaveBestEmbedding(keras.callbacks.Callback):
         self.saved = False
 
     def on_epoch_end(self, epoch, logs=None):
+        del epoch
         logs = logs or {}
         raw = logs.get("loss")
         if raw is None:
@@ -75,23 +71,42 @@ class SaveBestEmbedding(keras.callbacks.Callback):
             return
         if loss < self._best:
             self._best = loss
-            MODELS_DIR.mkdir(parents=True, exist_ok=True)
             self._net.save(self._path)
             self.saved = True
-            logger.info(
-                "En iyi triplet loss=%.6f — model kaydedildi: %s",
-                loss,
-                self._path,
-            )
+            logger.info("En iyi triplet loss=%.6f — model kaydedildi: %s", loss, self._path)
+
+
+class BatchHardTripletLossStrategy:
+    """Varsayilan triplet loss stratejisi."""
+
+    def __init__(self, margin: float) -> None:
+        self.margin = margin
+
+    def compute_triplet_loss(
+        self,
+        anchor_embeddings: tf.Tensor,
+        positive_embeddings: tf.Tensor,
+        negative_embeddings: tf.Tensor,
+    ) -> tf.Tensor:
+        d_ap = tf.reduce_sum(tf.square(anchor_embeddings - positive_embeddings), axis=-1)
+        d_an_matrix = tf.reduce_sum(
+            tf.square(
+                tf.expand_dims(anchor_embeddings, axis=1)
+                - tf.expand_dims(negative_embeddings, axis=0)
+            ),
+            axis=-1,
+        )
+        d_an_hard = tf.reduce_min(d_an_matrix, axis=1)
+        return tf.reduce_mean(tf.nn.relu(d_ap - d_an_hard + self.margin))
 
 
 class TripletTrainingModel(keras.Model):
-    """Üçlü girişte paylaşımlı embedding ağı; triplet hinge loss."""
+    """Uclu giriste paylasimli embedding agi; loss strategy ile kayip hesaplar."""
 
-    def __init__(self, embedding_net: keras.Model, margin: float) -> None:
+    def __init__(self, embedding_net: keras.Model, loss_strategy: BatchHardTripletLossStrategy) -> None:
         super().__init__()
         self.embedding_net = embedding_net
-        self.margin = margin
+        self.loss_strategy = loss_strategy
 
     def call(self, inputs, training: bool = False):
         a, p, n = inputs
@@ -105,26 +120,11 @@ class TripletTrainingModel(keras.Model):
         (a, p, n), _ = data
         with tf.GradientTape() as tape:
             ea, ep, en = self((a, p, n), training=True)
-            d_ap = tf.reduce_sum(tf.square(ea - ep), axis=-1)
-            # Batch-hard negative: bu batch'teki tüm negatiflerden en yakın olanı seç.
-            # Böylece model zor negatiflerle daha iyi ayrım öğrenir.
-            d_an_matrix = tf.reduce_sum(
-                tf.square(tf.expand_dims(ea, axis=1) - tf.expand_dims(en, axis=0)),
-                axis=-1,
-            )
-            d_an_hard = tf.reduce_min(d_an_matrix, axis=1)
-            loss = tf.reduce_mean(tf.nn.relu(d_ap - d_an_hard + self.margin))
+            loss = self.loss_strategy.compute_triplet_loss(ea, ep, en)
         trainable = self.embedding_net.trainable_variables
         grads = tape.gradient(loss, trainable)
         self.optimizer.apply_gradients(zip(grads, trainable))
         return {"loss": loss}
-
-
-def _require_prepared_split() -> None:
-    train_dir = DATA_SPLIT_DIR / "train"
-    ann = DATA_SPLIT_DIR / TRAIN_ANNOTATIONS_NAME
-    if not train_dir.is_dir() or not ann.is_file():
-        raise RuntimeError("Önce data_agent.py çalıştırılmalıdır.")
 
 
 def _group_by_identity(paths: list[str], identities: list[str]) -> dict[str, list[int]]:
@@ -145,9 +145,7 @@ def _make_triplet_generator(
     all_ids = list(groups.keys())
     anchor_pool = [k for k, idxs in groups.items() if len(idxs) >= 2]
     if not anchor_pool:
-        raise RuntimeError(
-            "Triplet eğitimi için en az bir kimlikte 2+ görüntü gerekir."
-        )
+        raise RuntimeError("Triplet egitimi icin en az bir kimlikte 2+ goruntu gerekir.")
 
     def gen():
         while True:
@@ -210,19 +208,42 @@ def build_triplet_dataset(
     return ds
 
 
+def _require_prepared_split() -> None:
+    train_dir = DATA_SPLIT_DIR / "train"
+    ann = DATA_SPLIT_DIR / TRAIN_ANNOTATIONS_NAME
+    if not train_dir.is_dir() or not ann.is_file():
+        raise RuntimeError("Önce data_agent.py çalıştırılmalıdır.")
+
+
+def _build_run_model_path() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return MODELS_DIR / f"turtle_reid_model_{stamp}.keras"
+
+
 class TrainingAgent:
-    def run(self) -> None:
+    def __init__(self, *, backbone_name: str = "resnet50", loss_name: str = "batch_hard_triplet") -> None:
+        self._backbone_name = backbone_name
+        self._loss_name = loss_name
+        self._loss_strategy = self._build_loss_strategy(loss_name)
+
+    def _build_embedding_model(self) -> keras.Model:
+        if self._backbone_name != "resnet50":
+            raise ValueError(f"Unsupported backbone: {self._backbone_name}")
+        return build_embedding_model(IMAGE_SIZE)
+
+    def _build_loss_strategy(self, loss_name: str) -> BatchHardTripletLossStrategy:
+        if loss_name != "batch_hard_triplet":
+            raise ValueError(f"Unsupported loss: {loss_name}")
+        return BatchHardTripletLossStrategy(TRIPLET_MARGIN)
+
+    def prepare_training_data(self) -> tf.data.Dataset:
         _require_prepared_split()
         paths, idents = load_image_label_pairs(
             DATA_SPLIT_DIR / TRAIN_ANNOTATIONS_NAME,
             DATA_SPLIT_DIR / "train",
         )
         if len(paths) < 6:
-            raise RuntimeError("Eğitim için yeterli görüntü yok (en az birkaç örnek gerekir).")
-
-        embedding_net = build_embedding_model(IMAGE_SIZE)
-        triplet = TripletTrainingModel(embedding_net, TRIPLET_MARGIN)
-
+            raise RuntimeError("Egitim icin yeterli goruntu yok (en az birkaç ornek gerekir).")
         train_ds = build_triplet_dataset(
             paths,
             idents,
@@ -231,13 +252,17 @@ class TrainingAgent:
             augment=True,
             seed=RANDOM_STATE,
         )
-        train_ds_y = train_ds.map(
+        return train_ds.map(
             lambda a, p, n: ((a, p, n), tf.zeros(BATCH_SIZE)),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
 
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        run_model_path = _build_run_model_path()
+    def build_training_model(self) -> tuple[keras.Model, TripletTrainingModel]:
+        embedding_net = self._build_embedding_model()
+        triplet = TripletTrainingModel(embedding_net, self._loss_strategy)
+        return embedding_net, triplet
+
+    def _build_callbacks(self, embedding_net: keras.Model, run_model_path: Path) -> list[keras.callbacks.Callback]:
         save_best = SaveBestEmbedding(embedding_net, run_model_path)
         early_stopping = keras.callbacks.EarlyStopping(
             monitor="loss",
@@ -247,7 +272,15 @@ class TrainingAgent:
             restore_best_weights=True,
             verbose=1,
         )
-        set_resnet_backbone_trainable(embedding_net, False)
+        return [save_best, early_stopping]
+
+    def run_phase1(
+        self,
+        triplet: TripletTrainingModel,
+        train_ds_y: tf.data.Dataset,
+        callbacks: list[keras.callbacks.Callback],
+    ) -> None:
+        set_resnet_backbone_trainable(triplet.embedding_net, False)
         triplet.compile(optimizer=make_optimizer(LEARNING_RATE_BACKBONE_FROZEN))
         logger.info("Phase 1: frozen backbone, %d epochs", FREEZE_BACKBONE_EPOCHS)
         triplet.fit(
@@ -255,18 +288,16 @@ class TrainingAgent:
             epochs=FREEZE_BACKBONE_EPOCHS,
             steps_per_epoch=_STEPS_PER_EPOCH,
             verbose=1,
-            callbacks=[save_best, early_stopping],
+            callbacks=callbacks,
         )
 
-        if save_best.saved:
-            embedding_net = keras.models.load_model(
-                run_model_path,
-                safe_mode=False,
-                custom_objects=custom_objects_for_model(),
-            )
-            triplet = TripletTrainingModel(embedding_net, TRIPLET_MARGIN)
-
-        set_resnet_backbone_trainable(embedding_net, True)
+    def run_phase2(
+        self,
+        triplet: TripletTrainingModel,
+        train_ds_y: tf.data.Dataset,
+        callbacks: list[keras.callbacks.Callback],
+    ) -> None:
+        set_resnet_backbone_trainable(triplet.embedding_net, True)
         triplet.compile(optimizer=make_optimizer(LEARNING_RATE_FINETUNE))
         logger.info("Phase 2: fine-tune full model, up to %d epochs", TRIPLET_EPOCHS)
         triplet.fit(
@@ -274,28 +305,45 @@ class TrainingAgent:
             epochs=TRIPLET_EPOCHS,
             steps_per_epoch=_STEPS_PER_EPOCH,
             verbose=1,
-            callbacks=[save_best, early_stopping],
+            callbacks=callbacks,
         )
 
-        if not save_best.saved:
+    def save_best_model(
+        self,
+        embedding_net: keras.Model,
+        run_model_path: Path,
+        save_best_callback: SaveBestEmbedding,
+    ) -> None:
+        if not save_best_callback.saved:
             MODELS_DIR.mkdir(parents=True, exist_ok=True)
             embedding_net.save(run_model_path)
-            logger.warning(
-                "Hiç kayıt tetiklenmedi; son ağırlıklar yazıldı: %s",
-                run_model_path,
-            )
+            logger.warning("Hic kayit tetiklenmedi; son agirliklar yazildi: %s", run_model_path)
         else:
-            logger.info(
-                "Kayıtlı model en düşük eğitim triplet loss anındaki ağırlıklar: %s",
-                run_model_path,
-            )
-
+            logger.info("Kayitli model en dusuk triplet loss anindaki agirliklar: %s", run_model_path)
         shutil.copy2(run_model_path, MODEL_SAVE_PATH)
-        logger.info(
-            "En güncel model pointer güncellendi: %s -> %s",
-            run_model_path.name,
-            MODEL_SAVE_PATH,
-        )
+        logger.info("En guncel model pointer guncellendi: %s", run_model_path.name)
+
+    def run(self) -> None:
+        train_ds_y = self.prepare_training_data()
+        embedding_net, triplet = self.build_training_model()
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        run_model_path = _build_run_model_path()
+        callbacks = self._build_callbacks(embedding_net, run_model_path)
+        save_best = callbacks[0]
+        if not isinstance(save_best, SaveBestEmbedding):
+            raise RuntimeError("Unexpected callback type for save-best.")
+
+        self.run_phase1(triplet, train_ds_y, callbacks)
+        if save_best.saved:
+            embedding_net = keras.models.load_model(
+                run_model_path,
+                safe_mode=False,
+                custom_objects=custom_objects_for_model(),
+            )
+            triplet = TripletTrainingModel(embedding_net, self._loss_strategy)
+
+        self.run_phase2(triplet, train_ds_y, callbacks)
+        self.save_best_model(embedding_net, run_model_path, save_best)
 
 
 def run_cli() -> None:

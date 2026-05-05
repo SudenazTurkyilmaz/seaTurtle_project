@@ -3,6 +3,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
-data_split/
+
 test_predictions.json
 
