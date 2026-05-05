@@ -1,0 +1,7 @@
+{
+  "top1_accuracy": 0.6280447662936142,
+  "same_similarity": 0.8949856201310625,
+  "different_similarity": 0.8947311763782263,
+  "num_samples": 1519,
+  "num_predictions": 1519
+}
